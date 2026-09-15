@@ -46,6 +46,64 @@
 4. 정보가 부족하면 부족한 항목만 골라서 되묻고, 이전 대화 내용은 `InMemorySaver` 기반 메모리로 계속 유지
 5. Gradio `ChatInterface`로 채팅 UI 제공
 
+## LangChain 핵심 개념
+
+이 프로젝트에서 사용한 LangChain/LangGraph 개념을 정리했습니다.
+
+### Chat Model — `init_chat_model`
+OpenAI, Google 등 서로 다른 LLM 제공사의 모델을 **동일한 인터페이스**로 다루게 해주는 함수입니다.
+```python
+model = init_chat_model("gpt-4o-mini", model_provider="openai", temperature=0.7)
+```
+`model_provider`와 모델명만 바꾸면 코드 변경 없이 다른 LLM(예: Gemini)으로 교체할 수 있습니다. 이 프로젝트는 실습 편의를 위해 `gpt-4o-mini` 하나만 사용했습니다.
+
+### Message — 대화를 표현하는 단위
+LangChain은 대화를 역할이 다른 메시지 객체들의 리스트로 표현합니다.
+- `HumanMessage` — 사용자의 입력
+- `AIMessage` — 모델의 응답 (Tool을 호출할 땐 `tool_calls` 정보도 포함)
+- `SystemMessage` — 모델의 역할·규칙을 지정하는 지시문 (System Prompt)
+- `ToolMessage` — Tool 실행 결과가 다시 모델에게 전달되는 메시지
+
+디버깅할 때 `result["messages"]`를 순회하며 이 메시지들의 흐름(`HumanMessage → AIMessage → ToolMessage → AIMessage`)을 직접 확인하는 것이 Agent가 실제로 어떻게 동작했는지 파악하는 핵심 방법이었습니다.
+
+### Tool — LLM이 호출할 수 있는 함수
+`@tool` 데코레이터를 붙이면 일반 파이썬 함수가 LLM이 호출 가능한 도구로 등록됩니다.
+```python
+@tool
+def make_reservation(name: str, phone: str, date: str, time: str, party: int, request: str = "") -> str:
+    """식당 예약을 접수한다. ..."""
+    ...
+```
+- 함수의 **타입 힌트**는 LLM이 어떤 타입의 값을 넣어야 하는지 판단하는 근거가 됩니다.
+- 함수의 **docstring**은 LLM이 "이 도구가 무엇을 하는지" 이해하는 유일한 설명서입니다. (이 프로젝트에서는 docstring에 비즈니스 로직의 세부 조건을 너무 구체적으로 적어서, LLM이 Tool을 호출하지 않고 스스로 판단해버리는 문제를 겪었습니다 — 아래 개발 후기 3번 참고)
+
+### Agent — Model과 Tool을 조합해 스스로 판단하게 만들기
+`create_agent(model, tools, ...)`는 "모델이 사용자 메시지를 보고, 필요하면 Tool을 호출하고,
+Tool 결과를 다시 반영해 최종 답변을 만드는" 반복 루프(ReAct 패턴)를 자동으로 구성해줍니다.
+개발자가 "언제 Tool을 호출할지" 직접 분기 코드를 짤 필요 없이, System Prompt로 방향을 제시하면
+Agent가 스스로 판단합니다.
+```python
+agent = create_agent(model=model, tools=[make_reservation], system_prompt=system_prompt, checkpointer=checkpointer)
+```
+
+### System Prompt — Agent의 역할과 규칙 지정
+Agent에게 성격, 지켜야 할 규칙, 대화 방식을 지정하는 문자열입니다. `create_agent`의 `system_prompt`
+인자로 전달합니다. 이 프로젝트에서는 "필수 정보가 모이기 전엔 Tool을 호출하지 마라",
+"정보가 모이면 예약 가능 여부와 상관없이 반드시 Tool을 호출하라" 같은 대화 흐름 규칙을 여기에 담았습니다.
+참고로 `system_prompt`는 선택 인자라 안 써도 동작은 하지만, 특정 역할·규칙이 필요한 경우엔 필수적입니다.
+
+### Memory — `InMemorySaver`와 `thread_id`
+LLM 자체는 이전 대화를 기억하지 못하기 때문에, LangGraph는 **checkpointer**로 대화 상태를 저장합니다.
+```python
+checkpointer = InMemorySaver()
+config = {"configurable": {"thread_id": "test1"}}
+agent.invoke({"messages": [...]}, config)
+```
+같은 `thread_id`로 여러 번 `invoke`하면 이전 메시지들이 자동으로 이어지고, 다른 `thread_id`를 쓰면
+완전히 새로운 대화로 취급됩니다. 이 덕분에 "이름만 먼저 말하고 나중에 나머지 정보를 채우는" 멀티턴 대화가
+별도의 상태 관리 코드 없이 가능했습니다. (`InMemorySaver`는 프로세스가 끝나면 사라지는 메모리 저장이라,
+실제 서비스라면 DB 기반 checkpointer로 교체가 필요합니다.)
+
 ## 개발 후기
 
 ### 1. 설계 단계에서 배운 것 — 요구사항을 먼저 구체화하는 습관
